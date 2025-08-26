@@ -101,8 +101,8 @@ def get_cve_record(cve_id : str):
                         if dict_entry['lang'] == 'en':                                      # try to find an english description
                             print(dict_entry['value'])
                             break
-                        else:
-                            print(cve_dict['containers']['cna']['descriptions'][0]['value'])    # print first description
+                    else:
+                        print(cve_dict['containers']['cna']['descriptions'][0]['value'])    # print first description
                     print(cve_dict['containers']['cna']['affected'])
                     return True
                 else:
