@@ -1,3 +1,13 @@
+'''
+TO DO
+
+check format of CISA ADP container in CVE RECORD 
+extract CISA ADP info if any
+
+also: CNA container has references, some may have 'exploit' tag --> collect url
+'''
+
+
 import click
 import json
 from prompt_toolkit import print_formatted_text, HTML, ANSI # type: ignore
@@ -5,6 +15,7 @@ import requests
 from  datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from pprint import pprint
+from html import escape
 
 #-------------------------------------------------------------------------- 
 # useful resources URL 
@@ -17,7 +28,7 @@ EPSS_SCORE_URL = 'https://api.first.org/data/v1/epss?cve='
 
 #--------------------------------------------------------------------------
 def get_cisa_catalog() -> list:
-    # get KEV catalog
+    
     try:
         local_copy_name = KEV_URL.split('/')[-1]
         with open(local_copy_name, 'r') as f:
@@ -37,7 +48,7 @@ def get_cisa_catalog() -> list:
                 json.dump(kev_dict, outfile)
         except Exception as err:
             log(f"{err}", 'error')
-            return None
+            return []
     
     kev_vulns = list(kev_dict['vulnerabilities'])  
     return kev_vulns   
@@ -63,21 +74,44 @@ def get_epss_score(cve_id : str) -> None:
 #--------------------------------------------------------------------------
 # get CVE RECORD Details 
 #--------------------------------------------------------------------------
-def get_cve_record(cve_id : str) -> bool:
+def get_cve_record(cve_id : str):
     
     try:
         r = requests.get(CVE_RECORD_URL + f'{cve_id}', timeout=10)
         r.raise_for_status()
         log(f'{cve_id} details:', 'success')
         cve_dict = json.loads(r.text)
-        if cve_dict['containers']['cna'].get('title') is not None:
-            log(f'{cve_dict['containers']['cna']['title']}', 'info')
-        metrics = cve_dict.get('containers', {}).get('cna', {}).get('metrics', [])
-        if metrics:
-            score = metrics[0].get('cvssV3_1', {}).get('baseScore', 'N/A')
-            log(f'CVSS v3.1 : {score}', 'info')
-        print(cve_dict['containers']['cna']['descriptions'][0]['value'])
-        return True
+        cveMetadata = cve_dict.get('cveMetadata', {})
+        if cveMetadata is not None:
+            if cveMetadata['state'] == "PUBLISHED":
+                cna = cve_dict.get('containers', {}).get('cna', {})
+                pprint(cna)
+                if cna is not None:
+                    if cna.get('title'):
+                        log(f'{cna['title']}', 'info')
+                    if cna.get('datePublic'):
+                        log(f'Date public : {cna['datePublic']}', 'info')
+                    metrics = cve_dict.get('containers', {}).get('cna', {}).get('metrics', [])
+                    if metrics:
+                        cvss_v3_1_data = next((d['cvssV3_1'] for d in metrics if 'cvssV3_1' in d), None)
+                        if cvss_v3_1_data:
+                            score = cvss_v3_1_data.get('baseScore', 'N/A')
+                            log(f'CVSS v3.1 : {score}', 'info')
+                    for dict_entry in cve_dict['containers']['cna']['descriptions']:
+                        if dict_entry['lang'] == 'en':                                      # try to find an english description
+                            print(dict_entry['value'])
+                            break
+                        else:
+                            print(cve_dict['containers']['cna']['descriptions'][0]['value'])    # print first description
+                    print(cve_dict['containers']['cna']['affected'])
+                    return True
+                else:
+                    log('CVE RECORD error : missing mandatory CNA container', 'error')
+                    return False
+            else: 
+                log('REJECTED', 'error')
+                return False
+
     except requests.exceptions.RequestException as e:
         log(f'{cve_id} Record error - {e}', 'error')
         return False
@@ -121,16 +155,17 @@ def get_nessus_plugins(cve_id : str):
         """ for tag in soup.find_all('script'):
             print(tag) """
         last_script_tag = soup.find("script", id="__NEXT_DATA__")
-        nessus_dict = json.loads(last_script_tag.text)
-        plugin_list = nessus_dict['props']['pageProps']['plugins']
-        #pprint(plugin_list)
-        p = [f'{plugin['_source']['script_id']} - {plugin['_source']['script_name']} - {plugin['_source']['script_family']}' for plugin in plugin_list]
-        if p:
-            p_string = '\n'.join(p)
-            log('NESSUS plugins coverage:', 'success')
-            print(p_string)
-        else:
-            log('No NESSUS coverage for this vulnerability', 'info')   
+        if last_script_tag is not None:
+            nessus_dict = json.loads(last_script_tag.text)
+            plugin_list = nessus_dict['props']['pageProps']['plugins']
+            #pprint(plugin_list)
+            p = [f'{plugin['_source']['script_id']} - {plugin['_source']['script_name']} - {plugin['_source']['script_family']}' for plugin in plugin_list]
+            if p:
+                p_string = '\n'.join(p)
+                log('NESSUS plugins coverage:', 'success')
+                print(p_string)
+            else:
+                log('No NESSUS coverage for this vulnerability', 'info')   
     else:
         log('Unable to get NESSUS coverage for this vulnerability', 'error')   
     return None
@@ -141,7 +176,7 @@ def log(message: str, level: str = 'info'):
     symbols = {'info': '[ ]', 'success': '[+]', 'error': '[-]'}
     color = colors.get(level, 'white')
     symbol = symbols.get(level, '[?]')
-    print_formatted_text(HTML(f'<{color}>{symbol} {message}</{color}>'))
+    print_formatted_text(HTML(f'<{color}>{symbol} {escape(message)}</{color}>'))
 
 #--------------------------------------------------------------------------
 @click.command()
