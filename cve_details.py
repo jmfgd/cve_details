@@ -85,15 +85,15 @@ def get_cve_record(cve_id : str):
         if cveMetadata is not None:
             if cveMetadata['state'] == "PUBLISHED":
                 cna = cve_dict.get('containers', {}).get('cna', {})
-                pprint(cna)
+                #pprint(cna)
                 if cna is not None:
                     if cna.get('title'):
                         log(f'{cna['title']}', 'info')
                     if cna.get('datePublic'):
                         log(f'Date public : {cna['datePublic']}', 'info')
-                    metrics = cve_dict.get('containers', {}).get('cna', {}).get('metrics', [])
+                    metrics = cve_dict.get('containers', {}).get('cna', {}).get('metrics', [])  
                     if metrics:
-                        cvss_v3_1_data = next((d['cvssV3_1'] for d in metrics if 'cvssV3_1' in d), None)
+                        cvss_v3_1_data = next((d['cvssV3_1'] for d in metrics if 'cvssV3_1' in d), None)    # get CVSS v3.1 score if exists
                         if cvss_v3_1_data:
                             score = cvss_v3_1_data.get('baseScore', 'N/A')
                             log(f'CVSS v3.1 : {score}', 'info')
@@ -102,14 +102,14 @@ def get_cve_record(cve_id : str):
                             print(dict_entry['value'])
                             break
                     else:
-                        print(cve_dict['containers']['cna']['descriptions'][0]['value'])    # print first description
-                    print(cve_dict['containers']['cna']['affected'])
+                        print(cve_dict['containers']['cna']['descriptions'][0]['value'])    # else print first available description
+                    #print(cve_dict['containers']['cna']['affected'])
                     return True
                 else:
                     log('CVE RECORD error : missing mandatory CNA container', 'error')
                     return False
             else: 
-                log('REJECTED', 'error')
+                log('REJECTED CVE-ID', 'error')
                 return False
 
     except requests.exceptions.RequestException as e:
@@ -126,23 +126,32 @@ def is_exploited(cve_id : str):
                 break
         else:
             log(f'{cve_id} is NOT known to be exploited', 'info')
+
 #--------------------------------------------------------------------------
 # get possible POCs available on GitHub
 #--------------------------------------------------------------------------
 def get_pocs(cve_id : str):
-    r = requests.get(POC_URL + cve_id, timeout=10)
-    if r.status_code == requests.codes.ok:
-        poc_dict = json.loads(r.text)
-        html_urls = []
-        if len(poc_dict['pocs']):
-            for poc in poc_dict['pocs']:
-                html_urls.append(poc['html_url'])
-        html_urls_txt = '\n'.join(html_urls)
-        if len(html_urls):
-            log('Available POC(s)', 'success')
-            print(html_urls_txt)
-    else:
-        log('Unable to find any PoCs', 'info')
+    
+    try:
+        r = requests.get(POC_URL + cve_id, timeout=10)
+        if r.status_code == requests.codes.ok:
+            poc_dict = json.loads(r.text)
+            html_urls = []
+            if len(poc_dict['pocs']):
+                for poc in poc_dict['pocs']:
+                    html_urls.append(poc['html_url'])
+            html_urls_txt = '\n'.join(html_urls)
+            if len(html_urls):
+                log('Available POC(s)', 'success')
+                print(html_urls_txt)
+            else:
+                log('Unable to find any PoCs for this CVE', 'info')
+        else:
+            log(f'requests.get returned {r.status_code}', 'info')        
+    
+    except requests.exceptions.RequestException as e:
+        log(f'get_pocs error {e}', 'error')
+        return False
     
 #--------------------------------------------------------------------------
 # get NESSUS plugins coverage for CVE ID
