@@ -12,52 +12,37 @@ Github POC availability
 
 import click
 import json
-from prompt_toolkit import print_formatted_text, HTML, ANSI # type: ignore
+from prompt_toolkit import print_formatted_text, HTML  # type: ignore
 import requests
-from  datetime import datetime, timezone
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
-from pprint import pprint
 from html import escape
-import csv
-import io
-import gzip
-import pandas as pd
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 
-#-------------------------------------------------------------------------- 
-# API and resources  
-#-------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------
+# API and resources
+#--------------------------------------------------------------------------
 KEV_CATALOG = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 POC_API = "https://poc-in-github.motikan2010.net/api/v1/"
 NESSUS_PLUGIN_URL = "https://www.tenable.com/cve/"
 CVE_RECORD_API = "https://cveawg.mitre.org/api/cve/"
 CVE_ORG_API = "https://cveawg.mitre.org/api/cve-id/"
 EPSS_SCORE_API = "https://api.first.org/data/v1/epss"
-EPSS_DATA = "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
 NVD_CVE_API = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
+
+REQUEST_TIMEOUT = 10  # seconds
+NESSUS_TIMEOUT = 20   # Nessus can be slower
+
+# Session for connection reuse and consistent headers
+session = requests.Session()
+session.headers.update({"User-Agent": "cve-details/1.0"})
+
+# Output mode control
+_quiet = False  # When True, suppress colored output (for JSON mode)
 #--------------------------------------------------------------------------
 
-def get_epss_data():
-    
-    try:
-        epss_data = requests.get(EPSS_DATA)
-        epss_data.raise_for_status()
-        compressed_data = io.BytesIO(epss_data.content)
-        with gzip.GzipFile(fileobj=compressed_data) as csv_file:
-            df = pd.read_csv(csv_file, skiprows=2)
-
-        epss_dict = df.set_index(df.columns[0]).apply(tuple, axis=1).to_dict()
-        #epss_dict = df.to_dict(orient="records")
-        print(epss_dict)
-        return df
-    except Exception as err:
-        log(f"{err}", "error")
-
-    return None
-
-
-#--------------------------------------------------------------------------
 def get_cisa_catalog() -> list:
     
     try:
@@ -73,7 +58,7 @@ def get_cisa_catalog() -> list:
         log(f"{err}", "error")
         log(f"Downloading {KEV_CATALOG}", "info")
         try:
-            r = requests.get(KEV_CATALOG, timeout=10)
+            r = session.get(KEV_CATALOG, timeout=REQUEST_TIMEOUT)
             kev_dict = json.loads(r.text)
             with open(KEV_CATALOG.split("/")[-1], "w") as outfile:
                 json.dump(kev_dict, outfile)
@@ -84,24 +69,25 @@ def get_cisa_catalog() -> list:
     kev_vulns = list(kev_dict["vulnerabilities"])  
     return kev_vulns   
 
-#-------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------
 # Get EPSS scoring
-#-------------------------------------------------------------------------- 
-def get_epss_score(cve_id : str) -> None:
-    
+#--------------------------------------------------------------------------
+def get_epss_score(cve_id: str) -> dict:
+    result = {"score": None, "percentile": None}
     try:
-        r = requests.get(EPSS_SCORE_API + f"?cve={cve_id}", timeout=10)
+        r = session.get(EPSS_SCORE_API + f"?cve={cve_id}", timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         epss_dict = json.loads(r.text)
         epss_data = epss_dict.get("data", [])
         if epss_data:
-            epss_score = epss_data[0].get("epss", "N/A")
-            percentile = int(float(epss_data[0].get("percentile")) * 100)
-            log(f"EPSS Score : {epss_score} - percentile : {percentile}", "success")  
+            result["score"] = epss_data[0].get("epss")
+            result["percentile"] = int(float(epss_data[0].get("percentile")) * 100)
+            log(f"EPSS Score : {result['score']} - percentile : {result['percentile']}", "success")
         else:
-            log(f"No EPSS Score", "info")  
+            log("No EPSS Score", "info")
     except requests.exceptions.RequestException as e:
-        log(f"EPSS Score error : {e}", "error")  
+        log(f"EPSS Score error : {e}", "error")
+    return result  
 
 #-------------------------------------------------------------------------- 
 #    Extracts the first CVE ID from a given text line.
@@ -118,19 +104,27 @@ def validate_cve_id(text_line):
     return match.group(0) if match else None
 
 #--------------------------------------------------------------------------
-# get CVE RECORD Details 
+# get CVE RECORD Details
 #--------------------------------------------------------------------------
-def get_cve_record(cve_id : str):
-    
+def get_cve_record(cve_id: str) -> dict | None:
+    result = {
+        "cve_id": cve_id,
+        "status": None,
+        "title": None,
+        "date_public": None,
+        "description": None,
+        "cvss": {}
+    }
     try:
-        r = requests.get(CVE_ORG_API + cve_id, timeout=10)
+        r = session.get(CVE_ORG_API + cve_id, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         cve_dict = json.loads(r.text)
         cveStatus = cve_dict.get("state", "N/A")
+        result["status"] = cveStatus
         if cveStatus != "PUBLISHED":
             log(f"{cve_id} Status: {cveStatus}", "info")
-            return False
-        r = requests.get(CVE_RECORD_API + f"{cve_id}", timeout=10)
+            return None
+        r = session.get(CVE_RECORD_API + f"{cve_id}", timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         log(f"{cve_id} details:", "success")
         cve_dict = json.loads(r.text)
@@ -139,125 +133,145 @@ def get_cve_record(cve_id : str):
             if cveMetadata["state"] == "PUBLISHED":
                 cna = cve_dict.get("containers", {}).get("cna", {})
                 if cna is not None:
-                    if cna.get("title"):
-                        log(f"{cna["title"]}", "info")
-                    if cna.get("datePublic"):
-                        log(f"Date public : {cna["datePublic"]}", "info")
-                    metrics = cve_dict.get("containers", {}).get("cna", {}).get("metrics", [])  
-                    versions = ["cvssV2_0", "cvssV3_0", "cvssV3_1", "cvssV4_0" ]
+                    result["title"] = cna.get("title")
+                    result["date_public"] = cna.get("datePublic")
+                    if result["title"]:
+                        log(f"{result['title']}", "info")
+                    if result["date_public"]:
+                        log(f"Date public : {result['date_public']}", "info")
+                    metrics = cve_dict.get("containers", {}).get("cna", {}).get("metrics", [])
+                    versions = ["cvssV2_0", "cvssV3_0", "cvssV3_1", "cvssV4_0"]
                     if metrics:
                         for d in metrics:
                             for version in versions:
                                 if d.get(version):
-                                    log(f"{version} : {d.get(version).get("baseScore", "N/A")} | {d.get(version).get("vectorString", "N/A")}", "info")
-                            
-                        """
-                        cvss_v3_1_data = next((d["cvssV3_1"] for d in metrics if "cvssV3_1" in d), None)    # get CVSS v3.1 score if exists
-                        if cvss_v3_1_data:
-                            score = cvss_v3_1_data.get("baseScore", "N/A")
-                            log(f"CVSS v3.1 : {score}", "info")
-                        """
+                                    result["cvss"][version] = {
+                                        "baseScore": d.get(version).get("baseScore"),
+                                        "vectorString": d.get(version).get("vectorString")
+                                    }
+                                    log(f"{version} : {d.get(version).get('baseScore', 'N/A')} | {d.get(version).get('vectorString', 'N/A')}", "info")
+                    # Get description
                     for dict_entry in cve_dict["containers"]["cna"]["descriptions"]:
-                        if dict_entry["lang"] == "en":                                      # try to find an english description
-                            print(dict_entry["value"])
+                        if dict_entry["lang"] == "en":
+                            result["description"] = dict_entry["value"]
                             break
                     else:
-                        print(cve_dict["containers"]["cna"]["descriptions"][0]["value"])    # else print first available description
-                    #print(cve_dict["containers"]["cna"]["affected"])
-                    return True
+                        result["description"] = cve_dict["containers"]["cna"]["descriptions"][0]["value"]
+                    if not _quiet:
+                        print(result["description"])
+                    return result
                 else:
                     log("CVE RECORD error : missing mandatory CNA container", "error")
-                    return False
-            else: 
+                    return None
+            else:
                 log("REJECTED CVE-ID", "error")
-                return False
-    except Exception as err:
-        log(f"{err}", "error")
-        return False
-
+                return None
     except requests.exceptions.RequestException as e:
         log(f"{cve_id} Record error - {e}", "error")
-        return False
-#--------------------------------------------------------------------------      
-def is_exploited(cve_id : str):
-    # check if exploited
-    kev_vulns = get_cisa_catalog()  
+        return None
+    except Exception as err:
+        log(f"{err}", "error")
+        return None
+#--------------------------------------------------------------------------
+def is_exploited(cve_id: str) -> dict:
+    result = {"exploited": False, "vulnerability_name": None, "date_added": None}
+    kev_vulns = get_cisa_catalog()
     if kev_vulns:
         for vuln in kev_vulns:
             if vuln["cveID"] == cve_id:
-                log(f"{cve_id} ({vuln["vulnerabilityName"]}) is exploited", "success")
+                result["exploited"] = True
+                result["vulnerability_name"] = vuln.get("vulnerabilityName")
+                result["date_added"] = vuln.get("dateAdded")
+                log(f"{cve_id} ({result['vulnerability_name']}) is exploited", "success")
                 break
         else:
             log(f"{cve_id} is NOT known to be exploited", "info")
+    return result
 
 #--------------------------------------------------------------------------
 # get possible POCs available on GitHub
 #--------------------------------------------------------------------------
-def get_pocs(cve_id : str):
-    
+def get_pocs(cve_id: str) -> list:
+    result = []
     try:
-        r = requests.get(POC_API + f"?cve_id={cve_id}", timeout=10)
+        r = session.get(POC_API + f"?cve_id={cve_id}", timeout=REQUEST_TIMEOUT)
         if r.status_code == requests.codes.ok:
             poc_dict = json.loads(r.text)
-            html_urls = []
-            if len(poc_dict["pocs"]):
-                for poc in poc_dict["pocs"]:
-                    html_urls.append(poc["html_url"])
-            html_urls_txt = "\n".join(html_urls)
-            if len(html_urls):
+            if poc_dict["pocs"]:
+                result = [poc["html_url"] for poc in poc_dict["pocs"]]
+            if result:
                 log("Available POC(s)", "success")
-                print(html_urls_txt)
+                if not _quiet:
+                    print("\n".join(result))
             else:
                 log("Unable to find any PoCs for this CVE", "info")
         else:
-            log(f"requests.get returned {r.status_code}", "info")        
-    
+            log(f"requests.get returned {r.status_code}", "info")
     except requests.exceptions.RequestException as e:
         log(f"get_pocs error {e}", "error")
-        return False
+    return result
     
 #--------------------------------------------------------------------------
 # get NESSUS plugins coverage for CVE ID
 #--------------------------------------------------------------------------
-def get_nessus_plugins(cve_id : str):
+def get_nessus_plugins(cve_id: str) -> list:
+    result = []
     try:
-        r = requests.get(NESSUS_PLUGIN_URL + f"{cve_id}/plugins", timeout=20)
+        r = session.get(NESSUS_PLUGIN_URL + f"{cve_id}/plugins", timeout=NESSUS_TIMEOUT)
         if r.status_code == requests.codes.ok:
             soup = BeautifulSoup(r.text, "html.parser")
-            """ for tag in soup.find_all("script"):
-                print(tag) """
             last_script_tag = soup.find("script", id="__NEXT_DATA__")
             if last_script_tag is not None:
                 nessus_dict = json.loads(last_script_tag.text)
                 plugin_list = nessus_dict["props"]["pageProps"]["plugins"]
-                #pprint(plugin_list)
-                p = [f"{plugin["_source"]["script_id"]} - {plugin["_source"]["script_name"]} - {plugin["_source"]["script_family"]}" for plugin in plugin_list]
-                if p:
-                    p_string = "\n".join(p)
+                result = [
+                    {
+                        "id": plugin["_source"]["script_id"],
+                        "name": plugin["_source"]["script_name"],
+                        "family": plugin["_source"]["script_family"]
+                    }
+                    for plugin in plugin_list
+                ]
+                if result:
                     log("NESSUS plugins coverage:", "success")
-                    print(p_string)
+                    if not _quiet:
+                        for p in result:
+                            print(f"{p['id']} - {p['name']} - {p['family']}")
                 else:
-                    log("No NESSUS coverage for this vulnerability", "info")   
+                    log("No NESSUS coverage for this vulnerability", "info")
         else:
-            log("Unable to get NESSUS coverage for this vulnerability", "error")   
+            log("Unable to get NESSUS coverage for this vulnerability", "error")
     except requests.exceptions.RequestException as e:
         log(f"get NESSUS plugins data error {e}", "error")
-    return None
+    return result
 
 #------------------------------------------------------------------------
-def get_nvd(cve_id):
+def get_nvd(cve_id: str) -> dict:
+    result = {"cwe": [], "references": []}
     try:
-        r = requests.get(NVD_CVE_API + f"?cveId={cve_id}", timeout=10)
+        r = session.get(NVD_CVE_API + f"?cveId={cve_id}", timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        cve_dict = json.loads(r.text)
-        #pprint(cve_dict)
-        return True
+        nvd_data = json.loads(r.text)
+        vulnerabilities = nvd_data.get("vulnerabilities", [])
+        if vulnerabilities:
+            cve_item = vulnerabilities[0].get("cve", {})
+            # Extract CWE
+            weaknesses = cve_item.get("weaknesses", [])
+            for w in weaknesses:
+                for desc in w.get("description", []):
+                    if desc.get("value", "").startswith("CWE-"):
+                        result["cwe"].append(desc["value"])
+            # Extract references
+            refs = cve_item.get("references", [])
+            result["references"] = [ref.get("url") for ref in refs if ref.get("url")]
     except requests.exceptions.RequestException as e:
         log(f"get NVD data error {e}", "error")
-    return False
+    return result
 
 #--------------------------------------------------------------------------
 def log(message: str, level: str = "info"):
+    if _quiet:
+        return
     colors = {"info": "skyblue", "success": "ansigreen", "error": "ansired"}
     symbols = {"info": "[ ]", "success": "[+]", "error": "[-]"}
     color = colors.get(level, "white")
@@ -267,18 +281,54 @@ def log(message: str, level: str = "info"):
 #--------------------------------------------------------------------------
 @click.command()
 @click.argument("cve_id")
-def get_cve_details(cve_id : str):
-    
+@click.option("--json", "output_json", is_flag=True, help="Output results as JSON")
+def get_cve_details(cve_id: str, output_json: bool):
+    global _quiet
+    _quiet = output_json
+
     cve_id = validate_cve_id(cve_id.upper())
     if cve_id is None:
-        log("Bad CVE ID format", "error")        
-        exit()
-    if get_cve_record(cve_id):
-        get_nvd(cve_id)
-        get_epss_score(cve_id)
-        is_exploited(cve_id)
-        get_pocs(cve_id)
-        get_nessus_plugins(cve_id)
+        if output_json:
+            print(json.dumps({"error": "Bad CVE ID format"}))
+        else:
+            log("Bad CVE ID format", "error")
+        exit(1)
+
+    cve_record = get_cve_record(cve_id)
+    if cve_record:
+        # Run remaining checks in parallel for faster results
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_nvd = executor.submit(get_nvd, cve_id)
+            future_epss = executor.submit(get_epss_score, cve_id)
+            future_kev = executor.submit(is_exploited, cve_id)
+            future_pocs = executor.submit(get_pocs, cve_id)
+            future_nessus = executor.submit(get_nessus_plugins, cve_id)
+
+            # Collect results
+            nvd_data = future_nvd.result()
+            epss_data = future_epss.result()
+            kev_data = future_kev.result()
+            pocs_data = future_pocs.result()
+            nessus_data = future_nessus.result()
+
+        if output_json:
+            output = {
+                "cve_id": cve_record["cve_id"],
+                "status": cve_record["status"],
+                "title": cve_record["title"],
+                "date_public": cve_record["date_public"],
+                "description": cve_record["description"],
+                "cvss": cve_record["cvss"],
+                "cwe": nvd_data["cwe"],
+                "epss": epss_data,
+                "kev": kev_data,
+                "pocs": pocs_data,
+                "nessus_plugins": nessus_data,
+                "references": nvd_data["references"]
+            }
+            print(json.dumps(output, indent=2))
+    elif output_json:
+        print(json.dumps({"error": f"Could not retrieve CVE record for {cve_id}"}))
 
 #--------------------------------------------------------------------------
 if __name__ == "__main__":
